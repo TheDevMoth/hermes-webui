@@ -10909,6 +10909,7 @@ from api.streaming import (
     _sse,
     _sse_set_write_deadline,
     _run_agent_streaming,
+    _provider_routing_kwargs_for_agent,
     cancel_stream,
     _materialize_pending_user_turn_before_error,
     generate_session_title_for_session,
@@ -25249,10 +25250,20 @@ def _handle_chat_sync(handler, body):
             _api_key = _bundle["api_key"]
             _base_url = _bundle["base_url"]
             # OpenRouter provider_routing prefs (parity with tui_gateway and the
-            # gateway's TurnRunner). _pp_cfg is this session's profile config,
-            # already parsed above; fall back to the active profile's config
-            # for profile-less sessions.
-            _pr_cfg = (_pp_cfg or get_config()).get("provider_routing") or {}
+            # gateway's TurnRunner). Route them through the same signature-gated
+            # helper the streaming path uses, so (a) an older hermes-agent build
+            # lacking any of the six params does not TypeError this endpoint, and
+            # (b) a malformed provider_routing block (string/list) is treated as
+            # empty instead of 500ing the request. _pp_cfg is this session's
+            # profile config, already parsed above; fall back to the active
+            # profile's config for profile-less sessions.
+            try:
+                _sync_routing_params = set(inspect.signature(AIAgent.__init__).parameters)
+            except (TypeError, ValueError):
+                _sync_routing_params = set()
+            _routing_kwargs = _provider_routing_kwargs_for_agent(
+                _pp_cfg or get_config(), _sync_routing_params
+            )
             agent = AIAgent(
                 model=_model,
                 provider=_provider,
@@ -25264,12 +25275,7 @@ def _handle_chat_sync(handler, body):
                 quiet_mode=True,
                 enabled_toolsets=_resolve_cli_toolsets(),
                 session_id=s.session_id,
-                providers_allowed=_pr_cfg.get("only"),
-                providers_ignored=_pr_cfg.get("ignore"),
-                providers_order=_pr_cfg.get("order"),
-                provider_sort=_pr_cfg.get("sort"),
-                provider_require_parameters=_pr_cfg.get("require_parameters", False),
-                provider_data_collection=_pr_cfg.get("data_collection"),
+                **_routing_kwargs,
                 **_agent_bundle_kwargs(AIAgent, _bundle),
             )
             from api.streaming import (
