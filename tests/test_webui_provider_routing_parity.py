@@ -21,6 +21,11 @@ These tests:
     kwargs through the same signature-gated helper and passes them via a
     ``**`` expansion (NOT unconditionally as explicit kwargs, which would
     TypeError an older hermes-agent build);
+  * prove the sync path's ``_sync_routing_kwargs`` resolves ``${VAR}``
+    references in ``provider_routing`` (the raw profile config it reads is
+    NOT env-expanded; only the main get_config() loader is), with the
+    profile-scoped env taking precedence over process env, matching the
+    streaming path's expanded config;
   * prove a stub ``AIAgent`` whose ``__init__`` lacks the routing params is
     still constructible through the sync gating (no TypeError);
   * prove the per-session agent-cache signature CHANGES when
@@ -261,10 +266,18 @@ def test_chat_sync_agent_routing_is_signature_gated():
             "expected **_routing_kwargs on the _handle_chat_sync AIAgent call"
         )
 
-    fn_src = ast.get_source_segment(src_mod, fn)
-    assert "_provider_routing_kwargs_for_agent(" in fn_src, (
-        "_handle_chat_sync must build routing kwargs via the shared helper"
+    seam_calls = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_sync_routing_kwargs"
+    ]
+    assert seam_calls, (
+        "_handle_chat_sync must build routing kwargs via _sync_routing_kwargs "
+        "(env-expanded profile config through the shared signature-gated "
+        "helper)"
     )
+    fn_src = ast.get_source_segment(src_mod, fn)
     assert ("signature(AIAgent" in fn_src) or ("inspect.signature" in fn_src), (
         "_handle_chat_sync must gate routing kwargs on the AIAgent constructor "
         "signature"
@@ -335,3 +348,50 @@ def test_agent_cache_signature_changes_when_routing_edited():
     assert sig_price == streaming_mod._compute_agent_cache_signature(
         **base, provider_routing_kwargs={"provider_sort": "price"}
     ), "same routing must keep the signature stable within a turn"
+
+
+# ── Sync-path env expansion ─────────────────────────────────────────────────
+
+def test_sync_routing_kwargs_expand_env_vars(monkeypatch):
+    """The sync path must resolve ``${VAR}`` references inside
+    ``provider_routing``.
+
+    ``_handle_chat_sync`` reads the session profile config through
+    ``_read_profile_model_config``: a RAW ``yaml.safe_load`` with no env
+    expansion (only the main ``get_config()`` loader expands). Without
+    expansion, ``provider_routing: {only: [${ROUTE_PROVIDER}]}`` reaches the
+    Agent as the literal string ``${ROUTE_PROVIDER}`` and is sent straight
+    into OpenRouter's request body. ``_sync_routing_kwargs`` must expand with
+    the same ``_expand_env_vars()`` the loader uses, matching the streaming
+    path (which reads an already-expanded config)."""
+    from api import routes as routes_mod
+    from api import config as config_mod
+
+    cfg = {"provider_routing": {"only": ["${ROUTE_PROVIDER}"], "sort": "price"}}
+    params = ROUTING_KWARGS
+
+    # Process env fallback: no thread-local profile env set.
+    monkeypatch.setenv("ROUTE_PROVIDER", "openrouter")
+    config_mod._clear_thread_env()
+    out = routes_mod._sync_routing_kwargs(cfg, params)
+    assert out["providers_allowed"] == ["openrouter"], (
+        f"${{ROUTE_PROVIDER}} must resolve against the environment, got "
+        f"{out['providers_allowed']!r}"
+    )
+    assert out["provider_sort"] == "price"
+    assert "${" not in str(out), (
+        "a literal ${...} reference must never reach the Agent"
+    )
+
+    # Profile-scoped env (thread-local, active when the request runs under a
+    # profile env scope) takes precedence over process env, exactly like the
+    # streaming path's env resolution.
+    config_mod._set_thread_env(ROUTE_PROVIDER="profileval")
+    try:
+        out2 = routes_mod._sync_routing_kwargs(cfg, params)
+    finally:
+        config_mod._clear_thread_env()
+    assert out2["providers_allowed"] == ["profileval"], (
+        "the profile-scoped env value must win over the process env"
+    )
+    assert "${" not in str(out2)
